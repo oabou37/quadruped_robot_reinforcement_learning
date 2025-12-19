@@ -1,333 +1,232 @@
 #include "Kinematics.h"
+#include "trajecgen.h" 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
-#include "trajectory_generator.h"
+
 #include <memory>
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <map>
+#include <string>
 
 using namespace std::chrono_literals;
 
 class QuadrupedGaitController : public rclcpp::Node
 {
 public:
-    QuadrupedGaitController() : Node("quadruped_gait_controller"), swing_(1)
+    QuadrupedGaitController() : Node("quadruped_gait_controller"), 
+                                swing_phase_(1), 
+                                is_initialized_(false),
+                                current_cycle_time_(0.0)
     {
-        // Initialize variables
+        // === PARAMÈTRES CORRIGÉS ===
+        T_duration_ = 0.25; // 0.25 secondes par phase
+        dt_ = 0.02;         // 50Hz
+        
+        // 1. CORRECTION HAUTEUR : On baisse le robot pour rester dans l'espace de travail
+        // Si les jambes font 0.30m (0.15+0.15), 0.33m est impossible. 0.27m est sûr.
+        H_ = 0.27; 
+        
+        SH_ = 0.05; // Hauteur de levée du pied (Step Height)
+        SL_ = 0.0;  // Longueur de pas (dynamique)
+
+        // Initialisation variables
         req_vel_ = {0.0, 0.0};
-        FL_current_xyz_st_ = {0.0, 0.0, 0.0};
-        RL_current_xyz_st_ = {0.0, 0.0, 0.0};
-        FR_current_xyz_st_ = {0.0, 0.0, 0.0};
-        RR_current_xyz_st_ = {0.0, 0.0, 0.0};
         
-        // Initialize joint positions message
-        jnt_set_st_.data.resize(12, 0.0);
+        // Positions XYZ [FL, FR, RL, RR]
+        current_xyz_pos_.resize(4, {0.0, 0.0, 0.0});
+        start_xyz_pos_.resize(4, {0.0, 0.0, 0.0});
+        target_xyz_pos_.resize(4, {0.0, 0.0, 0.0});
+
+        jnt_command_msg_.data.resize(12, 0.0);
+
+        // Publishers & Subscribers
+        jnt_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("joint_commands", 10);
         
-        RCLCPP_INFO(this->get_logger(), "Starting the gait Controller....");
-        
-        // Create publisher for joint commands
-        jnt_st_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
-            "joint_commands", 10);
-        
-        // Create subscribers
         req_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
             "/cmd_vel", 10,
             std::bind(&QuadrupedGaitController::req_vel_callback, this, std::placeholders::_1));
-        
-        crnt_jnt_st_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
+
+        jnt_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 10,
-            std::bind(&QuadrupedGaitController::joint_current_act_state_callback, this, std::placeholders::_1));
-        
-        RCLCPP_INFO(this->get_logger(), "Topic subscription and publication successful");
-        
-        // One time run functions
+            std::bind(&QuadrupedGaitController::joint_state_callback, this, std::placeholders::_1));
+
+        // Calcul initial des angles de mouvement
+        // Note: Assurez-vous que L1, body_length, etc. sont bien définis dans Kinematics.h
         Robot_angular_mtn_angles_ = Robot_angular_motion_endpoints(L1, body_length, body_width, SL_);
-        RCLCPP_INFO(this->get_logger(), "Twist angle estimation successful");
-        
-        // Create timer for main control loop (50 Hz)
+
+        // Timer de contrôle 50Hz
         timer_ = this->create_wall_timer(
-            20ms, std::bind(&QuadrupedGaitController::control_loop, this));
-        
-        RCLCPP_INFO(this->get_logger(), "Gait controller initialized. Use Ctrl-C to quit");
+            std::chrono::duration<double>(dt_), 
+            std::bind(&QuadrupedGaitController::control_tick, this));
+
+        RCLCPP_INFO(this->get_logger(), "Quadruped Gait Controller Started (Corrected). Waiting for JointStates...");
     }
 
 private:
-    // Member variables
+    // --- Variables d'état ---
+    bool is_initialized_;
+    double current_cycle_time_;
+    double T_duration_;
+    double dt_;
+    int swing_phase_;
+
+    // Paramètres
+    double SL_;
+    double SH_;
+    double H_;
+
+    // Données
     std::vector<double> req_vel_;
-    std::vector<double> FL_current_xyz_st_;
-    std::vector<double> RL_current_xyz_st_;
-    std::vector<double> FR_current_xyz_st_;
-    std::vector<double> RR_current_xyz_st_;
-    
-    std_msgs::msg::Float64MultiArray jnt_set_st_;
-    
-    double SL_ = 0.2;     // step length
-    double SH_ = 0.03;    // step height
-    double Height_ = 0.33; // standing height
-    
-    int swing_;
     std::vector<std::vector<double>> Robot_angular_mtn_angles_;
-    
-    // ROS2 publishers, subscribers, and timer
-    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr jnt_st_pub_;
+
+    // Positions [Patte][X,Y,Z]
+    std::vector<std::vector<double>> current_xyz_pos_;
+    std::vector<std::vector<double>> start_xyz_pos_;
+    std::vector<std::vector<double>> target_xyz_pos_;
+
+    // ROS
+    std_msgs::msg::Float64MultiArray jnt_command_msg_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr jnt_pub_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr req_vel_sub_;
-    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr crnt_jnt_st_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr jnt_state_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
-    
-    // Callback functions
+
+    // --- Callbacks ---
+
     void req_vel_callback(const geometry_msgs::msg::Twist::SharedPtr msg)
     {
         req_vel_[0] = msg->linear.x;
         req_vel_[1] = msg->angular.z;
-        
-        // Changes step length depending on velocity to keep robot stable
-        SL_ = std::min(0.2, std::sqrt(std::pow(req_vel_[0], 2) + 
-                                      std::pow(req_vel_[1], 2)) * 0.1);
+        // SL adapté à la vitesse
+        SL_ = std::min(0.2, std::sqrt(std::pow(req_vel_[0], 2) + std::pow(req_vel_[1], 2)) * 0.25);
     }
-    
-    void joint_current_act_state_callback(const sensor_msgs::msg::JointState::SharedPtr msg)
+
+    void joint_state_callback(const sensor_msgs::msg::JointState::SharedPtr msg)
     {
-        if (msg->position.size() < 12) {
-            RCLCPP_WARN(this->get_logger(), "Received incomplete joint state");
-            return;
+        // 1. Mapping sécurisé (À ADAPTER SELON VOTRE URDF)
+        std::map<std::string, double> jnt_map;
+        for (size_t i = 0; i < msg->name.size(); ++i) {
+            jnt_map[msg->name[i]] = msg->position[i];
         }
-        
-        std::vector<double> FL_current_jnt_st = {0, 0, 0};
-        std::vector<double> RL_current_jnt_st = {0, 0, 0};
-        std::vector<double> FR_current_jnt_st = {0, 0, 0};
-        std::vector<double> RR_current_jnt_st = {0, 0, 0};
-        
-        // Joint mapping - adapt according to your robot's joint order
-        // Assuming joint order: [front_right_rolling, front_right_pitching, front_right_knee,
-        //                        front_left_rolling, front_left_pitching, front_left_knee,
-        //                        back_right_rolling, back_right_pitching, back_right_knee,
-        //                        back_left_rolling, back_left_pitching, back_left_knee]
-        
-        // Front Left
-        FL_current_jnt_st[0] = msg->position[3];  // rolling
-        FL_current_jnt_st[1] = msg->position[4];  // pitching
-        FL_current_jnt_st[2] = msg->position[5];  // knee
-        
-        // Front Right
-        FR_current_jnt_st[0] = msg->position[0];
-        FR_current_jnt_st[1] = msg->position[1];
-        FR_current_jnt_st[2] = msg->position[2];
-        
-        // Back Left
-        RL_current_jnt_st[0] = msg->position[9];
-        RL_current_jnt_st[1] = msg->position[10];
-        RL_current_jnt_st[2] = msg->position[11];
-        
-        // Back Right
-        RR_current_jnt_st[0] = msg->position[6];
-        RR_current_jnt_st[1] = msg->position[7];
-        RR_current_jnt_st[2] = msg->position[8];
-        
-        // Convert joint states to xyz positions using FK
-        FL_current_xyz_st_ = Front_Left_Leg_FK(FL_current_jnt_st);
-        RL_current_xyz_st_ = Back_Left_Leg_FK(RL_current_jnt_st);
-        FR_current_xyz_st_ = Front_Right_Leg_FK(FR_current_jnt_st);
-        RR_current_xyz_st_ = Back_Right_Leg_FK(RR_current_jnt_st);
-    }
-    
-    // Matrix multiplication helper
-    std::vector<std::vector<double>> Multiply(
-        const std::vector<std::vector<double>>& a,
-        const std::vector<std::vector<double>>& b)
-    {
-        const int n = a.size();
-        const int m = a[0].size();
-        const int p = b[0].size();
-        std::vector<std::vector<double>> c(n, std::vector<double>(p, 0));
-        
-        for (int j = 0; j < p; ++j) {
-            for (int k = 0; k < m; ++k) {
-                for (int i = 0; i < n; ++i) {
-                    c[i][j] += a[i][k] * b[k][j];
-                }
+
+        try {
+            // Remplacez les chaînes ci-dessous par les vrais noms de vos joints
+            std::vector<double> FL_jnt = {jnt_map.at("FL_roll"), jnt_map.at("FL_pitch"), jnt_map.at("FL_knee")};
+            std::vector<double> FR_jnt = {jnt_map.at("FR_roll"), jnt_map.at("FR_pitch"), jnt_map.at("FR_knee")};
+            std::vector<double> RL_jnt = {jnt_map.at("RL_roll"), jnt_map.at("RL_pitch"), jnt_map.at("RL_knee")};
+            std::vector<double> RR_jnt = {jnt_map.at("RR_roll"), jnt_map.at("RR_pitch"), jnt_map.at("RR_knee")};
+
+            current_xyz_pos_[0] = Front_Left_Leg_FK(FL_jnt);
+            current_xyz_pos_[1] = Front_Right_Leg_FK(FR_jnt);
+            current_xyz_pos_[2] = Back_Left_Leg_FK(RL_jnt);
+            current_xyz_pos_[3] = Back_Right_Leg_FK(RR_jnt);
+
+            if (!is_initialized_) {
+                start_xyz_pos_ = current_xyz_pos_;
+                target_xyz_pos_ = current_xyz_pos_; 
+                is_initialized_ = true;
+                RCLCPP_INFO(this->get_logger(), "Initialized. H_body set to %.2f m", H_);
             }
+
+        } catch (const std::out_of_range& e) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
+                "Joint mapping error. Check URDF names vs Code.");
         }
-        return c;
     }
-    
-    // Trajectory execution function
-    void Trajectory_exec(std::vector<std::vector<double>> Trajectory_end_points, int swing)
+
+    // --- Boucle Principale ---
+    void control_tick()
     {
-        auto start_time = this->now();
-        rclcpp::Rate loop_rate(500);
+        if (!is_initialized_) return;
+
+        current_cycle_time_ += dt_;
+
+        // Fin de cycle : Changement de phase
+        if (current_cycle_time_ >= T_duration_) {
+            current_cycle_time_ = 0.0;
+            swing_phase_ = 1 - swing_phase_;
+            
+            // Le point de départ du nouveau mouvement est la position actuelle
+            start_xyz_pos_ = current_xyz_pos_;
+
+            // Calcul des cibles pour la fin du cycle
+            target_xyz_pos_ = Robot_end_points(req_vel_, Robot_angular_mtn_angles_, swing_phase_, SL_, H_);
+        }
+
+        double u = current_cycle_time_ / T_duration_;
+        u = std::max(0.0, std::min(1.0, u));
+
+        // Génération trajectoires
+        process_leg(0, u, swing_phase_ == 1); // FL
+        process_leg(3, u, swing_phase_ == 1); // RR
+        process_leg(1, u, swing_phase_ == 0); // FR
+        process_leg(2, u, swing_phase_ == 0); // RL
+
+        jnt_pub_->publish(jnt_command_msg_);
+    }
+
+    // --- Cœur Mathématique (Corrigé) ---
+    void process_leg(int leg_index, double u, bool is_swinging)
+    {
+        std::vector<double> next_pos(3);
         
-        if (swing) {
-            // FL and RR swing phase (diagonal gait)
-            auto FL_1 = FL_current_xyz_st_;
-            auto FL_3 = Trajectory_end_points[0];
-            std::vector<double> FL_2 = {
-                ((FL_1[0] + FL_3[0]) / 2) - SH_,
-                (FL_1[1] + FL_3[1]) / 2,
-                (FL_1[2] + FL_3[2]) / 2
+        if (is_swinging) {
+            // 2. CORRECTION TRAJECTOIRE : Méthode de Lagrange (Parabole exacte)
+            // Plus de matrices compliquées, juste des poids polynomiaux
+            
+            // Calcul des poids pour t=0 (start), t=0.5 (mid), t=1 (end)
+            double w_start = 2 * u * u - 3 * u + 1;
+            double w_mid   = -4 * u * u + 4 * u;
+            double w_end   = 2 * u * u - u;
+            
+            // Définition du point milieu (Sommet de la parabole)
+            // X, Y = Milieu géométrique
+            // Z = Hauteur moyenne + Step Height (Levée du pied)
+            std::vector<double> mid_point = {
+                (start_xyz_pos_[leg_index][0] + target_xyz_pos_[leg_index][0]) / 2.0,
+                (start_xyz_pos_[leg_index][1] + target_xyz_pos_[leg_index][1]) / 2.0,
+                (start_xyz_pos_[leg_index][2] + target_xyz_pos_[leg_index][2]) / 2.0 + SH_
             };
-            
-            std::vector<std::vector<double>> FL_x = {
-                {FL_1[0], FL_2[0], FL_3[0]},
-                {FL_1[1], FL_2[1], FL_3[1]},
-                {FL_1[2], FL_2[2], FL_3[2]}
-            };
-            auto FL_XB = Multiply(FL_x, blending_matrix);
-            
-            auto RR_1 = RR_current_xyz_st_;
-            auto RR_3 = Trajectory_end_points[3];
-            std::vector<double> RR_2 = {
-                ((RR_1[0] + RR_3[0]) / 2) - SH_,
-                (RR_1[1] + RR_3[1]) / 2,
-                (RR_1[2] + RR_3[2]) / 2
-            };
-            
-            std::vector<std::vector<double>> RR_x = {
-                {RR_1[0], RR_2[0], RR_3[0]},
-                {RR_1[1], RR_2[1], RR_3[1]},
-                {RR_1[2], RR_2[2], RR_3[2]}
-            };
-            auto RR_XB = Multiply(RR_x, blending_matrix);
-            
-            auto FR_1 = FR_current_xyz_st_;
-            auto FR_2 = Trajectory_end_points[1];
-            
-            auto RL_1 = RL_current_xyz_st_;
-            auto RL_2 = Trajectory_end_points[2];
-            
-            while (((this->now() - start_time).seconds() < T) && rclcpp::ok()) {
-                double u = (this->now() - start_time).seconds() / T;
-                
-                std::vector<double> FL_req_pos(3), FR_req_pos(3), RL_req_pos(3), RR_req_pos(3);
-                std::vector<std::vector<double>> U_mat = {{1}, {u}, {std::pow(u, 2)}};
-                
-                // Front Left (swing)
-                auto FL_XBU = Multiply(FL_XB, U_mat);
-                FL_req_pos = {FL_XBU[0][0], FL_XBU[1][0], FL_XBU[2][0]};
-                auto FL_req_jnt = Front_Left_Leg_IK(FL_req_pos);
-                jnt_set_st_.data[3] = FL_req_jnt[0];
-                jnt_set_st_.data[4] = FL_req_jnt[1];
-                jnt_set_st_.data[5] = FL_req_jnt[2];
-                
-                // Rear Right (swing)
-                auto RR_XBU = Multiply(RR_XB, U_mat);
-                RR_req_pos = {RR_XBU[0][0], RR_XBU[1][0], RR_XBU[2][0]};
-                auto RR_req_jnt = Back_Right_Leg_IK(RR_req_pos);
-                jnt_set_st_.data[6] = RR_req_jnt[0];
-                jnt_set_st_.data[7] = RR_req_jnt[1];
-                jnt_set_st_.data[8] = RR_req_jnt[2];
-                
-                // Front Right (stance - linear interpolation)
-                for (int i = 0; i < 3; ++i)
-                    FR_req_pos[i] = FR_1[i] * (1 - u) + FR_2[i] * u;
-                auto FR_req_jnt = Front_Right_Leg_IK(FR_req_pos);
-                jnt_set_st_.data[0] = FR_req_jnt[0];
-                jnt_set_st_.data[1] = FR_req_jnt[1];
-                jnt_set_st_.data[2] = FR_req_jnt[2];
-                
-                // Rear Left (stance - linear interpolation)
-                for (int i = 0; i < 3; ++i)
-                    RL_req_pos[i] = RL_1[i] * (1 - u) + RL_2[i] * u;
-                auto RL_req_jnt = Back_Left_Leg_IK(RL_req_pos);
-                jnt_set_st_.data[9] = RL_req_jnt[0];
-                jnt_set_st_.data[10] = RL_req_jnt[1];
-                jnt_set_st_.data[11] = RL_req_jnt[2];
-                
-                jnt_st_pub_->publish(jnt_set_st_);
-                loop_rate.sleep();
+
+            // Application de la formule
+            for(int i=0; i<3; i++) {
+                next_pos[i] = w_start * start_xyz_pos_[leg_index][i] + 
+                              w_mid   * mid_point[i] + 
+                              w_end   * target_xyz_pos_[leg_index][i];
             }
+
         } else {
-            // FR and RL swing phase
-            auto FR_1 = FR_current_xyz_st_;
-            auto FR_3 = Trajectory_end_points[1];
-            std::vector<double> FR_2 = {
-                ((FR_1[0] + FR_3[0]) / 2) - SH_,
-                (FR_1[1] + FR_3[1]) / 2,
-                (FR_1[2] + FR_3[2]) / 2
-            };
-            
-            std::vector<std::vector<double>> FR_x = {
-                {FR_1[0], FR_2[0], FR_3[0]},
-                {FR_1[1], FR_2[1], FR_3[1]},
-                {FR_1[2], FR_2[2], FR_3[2]}
-            };
-            auto FR_XB = Multiply(FR_x, blending_matrix);
-            
-            auto RL_1 = RL_current_xyz_st_;
-            auto RL_3 = Trajectory_end_points[2];
-            std::vector<double> RL_2 = {
-                ((RL_1[0] + RL_3[0]) / 2) - SH_,
-                (RL_1[1] + RL_3[1]) / 2,
-                (RL_1[2] + RL_3[2]) / 2
-            };
-            
-            std::vector<std::vector<double>> RL_x = {
-                {RL_1[0], RL_2[0], RL_3[0]},
-                {RL_1[1], RL_2[1], RL_3[1]},
-                {RL_1[2], RL_2[2], RL_3[2]}
-            };
-            auto RL_XB = Multiply(RL_x, blending_matrix);
-            
-            auto FL_1 = FL_current_xyz_st_;
-            auto FL_2 = Trajectory_end_points[0];
-            
-            auto RR_1 = RR_current_xyz_st_;
-            auto RR_2 = Trajectory_end_points[3];
-            
-            while (((this->now() - start_time).seconds() < T) && rclcpp::ok()) {
-                double u = (this->now() - start_time).seconds() / T;
-                
-                std::vector<double> FL_req_pos(3), FR_req_pos(3), RL_req_pos(3), RR_req_pos(3);
-                std::vector<std::vector<double>> U_mat = {{1}, {u}, {std::pow(u, 2)}};
-                
-                // Front Right (swing)
-                auto FR_XBU = Multiply(FR_XB, U_mat);
-                FR_req_pos = {FR_XBU[0][0], FR_XBU[1][0], FR_XBU[2][0]};
-                auto FR_req_jnt = Front_Right_Leg_IK(FR_req_pos);
-                jnt_set_st_.data[0] = FR_req_jnt[0];
-                jnt_set_st_.data[1] = FR_req_jnt[1];
-                jnt_set_st_.data[2] = FR_req_jnt[2];
-                
-                // Rear Left (swing)
-                auto RL_XBU = Multiply(RL_XB, U_mat);
-                RL_req_pos = {RL_XBU[0][0], RL_XBU[1][0], RL_XBU[2][0]};
-                auto RL_req_jnt = Back_Left_Leg_IK(RL_req_pos);
-                jnt_set_st_.data[9] = RL_req_jnt[0];
-                jnt_set_st_.data[10] = RL_req_jnt[1];
-                jnt_set_st_.data[11] = RL_req_jnt[2];
-                
-                // Front Left (stance)
-                for (int i = 0; i < 3; ++i)
-                    FL_req_pos[i] = FL_1[i] * (1 - u) + FL_2[i] * u;
-                auto FL_req_jnt = Front_Left_Leg_IK(FL_req_pos);
-                jnt_set_st_.data[3] = FL_req_jnt[0];
-                jnt_set_st_.data[4] = FL_req_jnt[1];
-                jnt_set_st_.data[5] = FL_req_jnt[2];
-                
-                // Rear Right (stance)
-                for (int i = 0; i < 3; ++i)
-                    RR_req_pos[i] = RR_1[i] * (1 - u) + RR_2[i] * u;
-                auto RR_req_jnt = Back_Right_Leg_IK(RR_req_pos);
-                jnt_set_st_.data[6] = RR_req_jnt[0];
-                jnt_set_st_.data[7] = RR_req_jnt[1];
-                jnt_set_st_.data[8] = RR_req_jnt[2];
-                
-                jnt_st_pub_->publish(jnt_set_st_);
-                loop_rate.sleep();
+            // Interpolation Linéaire (Stance) - Resté inchangé car correct
+            for (int i = 0; i < 3; ++i) {
+                next_pos[i] = start_xyz_pos_[leg_index][i] * (1.0 - u) + target_xyz_pos_[leg_index][i] * u;
             }
         }
-    }
-    
-    // Main control loop
-    void control_loop()
-    {
-        std::vector<std::vector<double>> Trajectory_end_points = 
-            Robot_end_points(req_vel_, Robot_angular_mtn_angles_, swing_, SL_, Height_);
+
+        // IK et Remplissage Message
+        std::vector<double> joint_angles;
         
-        Trajectory_exec(Trajectory_end_points, swing_);
-        swing_ = 1 - swing_;
+        if (leg_index == 0) joint_angles = Front_Left_Leg_IK(next_pos);
+        else if (leg_index == 1) joint_angles = Front_Right_Leg_IK(next_pos);
+        else if (leg_index == 2) joint_angles = Back_Left_Leg_IK(next_pos);
+        else if (leg_index == 3) joint_angles = Back_Right_Leg_IK(next_pos);
+
+        // Attention à l'ordre dans le tableau (Dépend de votre driver)
+        int offset = 0;
+        if(leg_index == 1) offset = 0;      // FR
+        else if(leg_index == 0) offset = 3; // FL
+        else if(leg_index == 3) offset = 6; // RR
+        else if(leg_index == 2) offset = 9; // RL
+
+        // Si l'IK échoue (retourne nan ou vide), on garde la dernière position pour éviter le crash
+        if (joint_angles.size() == 3 && !std::isnan(joint_angles[0])) {
+            jnt_command_msg_.data[offset + 0] = joint_angles[0];
+            jnt_command_msg_.data[offset + 1] = joint_angles[1];
+            jnt_command_msg_.data[offset + 2] = joint_angles[2];
+        }
     }
 };
 
