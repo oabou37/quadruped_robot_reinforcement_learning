@@ -5,23 +5,30 @@
 #include <cmath>
 #include <iostream>
 
-// Suppression de "using namespace std;" pour éviter les conflits
-// Les variables globales (T, blending_matrix) sont déplacées dans la classe principale
-
 /**
- * @brief Calcule les angles de rotation nécessaires pour les mouvements angulaires
+ * @brief Computes the rotation angles required for angular body motions
+ *
+ * This function calculates how the robot body should rotate
+ * during in-place turning or while walking along a curved path.
  */
 std::vector<std::vector<double>> Robot_angular_motion_endpoints(
     double L1, double L, double W, double SL);
 
 /**
- * @brief Trouve les points d'intersection entre deux cercles (Cinématique inverse géométrique)
+ * @brief Finds the intersection point(s) between two circles
+ *
+ * This function is used for geometric inverse kinematics,
+ * ensuring that the foot placement remains physically reachable.
  */
 std::vector<double> Circle_intersection_points(
     double h, double k, double R1, double R2);
 
 /**
- * @brief Génère les positions cibles XYZ pour les 4 pieds du robot
+ * @brief Generates target XYZ positions for the robot’s four feet
+ *
+ * This is the main trajectory generation function.
+ * It computes where each foot should be placed at the end
+ * of the current gait phase.
  */
 std::vector<std::vector<double>> Robot_end_points(
     std::vector<double> req_vel, 
