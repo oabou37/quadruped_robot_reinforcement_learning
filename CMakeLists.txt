@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(quadruped_gazebo_simulation)
+project(quadruped_gait_control)
 
 # Default to C++17
 if(NOT CMAKE_CXX_STANDARD)
@@ -10,31 +10,32 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# Find dependencies
+# ============================================================================
+# FIND DEPENDENCIES
+# ============================================================================
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 
-# Include directories
+# ============================================================================
+# INCLUDE DIRECTORIES
+# ============================================================================
 include_directories(
   include
   ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${rclcpp_INCLUDE_DIRS}
-  ${std_msgs_INCLUDE_DIRS}
-  ${sensor_msgs_INCLUDE_DIRS}
-  ${geometry_msgs_INCLUDE_DIRS}
 )
 
-# Add executable
+# ============================================================================
+# GAIT CONTROLLER NODE
+# ============================================================================
 add_executable(gait_controller 
-  src/gait_controller_ros2.cpp 
-  src/trajectory_generator.cpp 
+  src/gait_controller.cpp 
+  src/trajecgen.cpp 
   src/Kinematics.cpp
 )
 
-# Specify dependencies for the executable
 ament_target_dependencies(gait_controller
   rclcpp
   std_msgs
@@ -42,31 +43,72 @@ ament_target_dependencies(gait_controller
   geometry_msgs
 )
 
-# Install executable
+# ============================================================================
+# JOINT COMMAND RELAY NODE (Convertit /joint_commands → /joint_states)
+# ============================================================================
+add_executable(joint_command_relay 
+  src/joint_command_relay.cpp
+)
+
+ament_target_dependencies(joint_command_relay
+  rclcpp
+  std_msgs
+  sensor_msgs
+)
+
+# ============================================================================
+# INSTALL EXECUTABLES
+# ============================================================================
 install(TARGETS
   gait_controller
+  joint_command_relay
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# Install header files
+# ============================================================================
+# INSTALL DIRECTORIES
+# ============================================================================
+
+# Headers
 install(DIRECTORY include/
   DESTINATION include/
 )
 
-# Install launch files (if you have any)
+# Launch files
 install(DIRECTORY
   launch
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+# URDF files
+install(DIRECTORY
+  urdf
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+# RViz configs
+install(DIRECTORY
+  rviz
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+# Meshes (si vous en avez)
+install(DIRECTORY
+  meshes
   DESTINATION share/${PROJECT_NAME}/
   OPTIONAL
 )
 
-# Install config files (if you have any)
+# Config files (si vous en avez)
 install(DIRECTORY
   config
   DESTINATION share/${PROJECT_NAME}/
   OPTIONAL
 )
 
+# ============================================================================
+# TESTING
+# ============================================================================
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
